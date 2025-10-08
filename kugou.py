@@ -15,7 +15,7 @@ HEADERS = {
 }
 
 # ✅ Save directly to Android Music folder
-OUTPUT_DIR = "/storage/emulated/0/Music/KuGou"
+OUTPUT_DIR = "/storage/emulated/0/Download/KuGou"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def windows_safe_name(name: str) -> str:
