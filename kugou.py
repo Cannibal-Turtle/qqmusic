@@ -2,10 +2,11 @@
 #!/usr/bin/env python3
 """
 KuGou downloader (free tracks only; no paywall bypass).
-- Saves to /storage/emulated/0/Download on Android/Termux
-- Chooses best cover: desktop API -> page og:image -> mobile imgUrl
-- Embeds cover + basic ID3 tags
-
+- Saves to /storage/emulated/0/Download (Android/Termux)
+- Picks best cover in this order:
+  desktop album_img -> album_img from page JSON -> page og:image -> album page og:image -> mobile imgUrl
+- Embeds cover + basic ID3
+- Title tag = just the song title (from "Artist - Title")
 Usage:
   python kugou.py "<kugou url>"
   python kugou.py "<kugou url>" --cover "https://example.com/cover.jpg"
@@ -17,7 +18,6 @@ from typing import Optional, Tuple, Dict
 import requests
 import mutagen.easyid3, mutagen.id3, mutagen.mp3
 
-# ---------- Config ----------
 CHUNK_SIZE = 1024 * 256
 
 HEADERS_DESKTOP = {
@@ -29,11 +29,10 @@ HEADERS_MOBILE = {
     "Referer": "https://m.kugou.com/",
 }
 
-# Save directly to Android "Download" folder
+# Save to Android "Download" folder
 OUTPUT_DIR = "/storage/emulated/0/Download"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------- Helpers ----------
 def windows_safe_name(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', " ", name)
     name = re.sub(r"\s+", " ", name).strip()
@@ -68,54 +67,44 @@ def ensure_id3_container(path: str):
         pass
 
 # ---------- URL / Hash ----------
-def parse_hash_album_from_url_or_page(url: str) -> Tuple[str, Optional[str]]:
+def parse_hash_album_from_url_or_page(url: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    Returns (hash, album_id?) by checking URL fragment/query first,
-    then scraping mixsong page if needed.
+    Returns (hash, album_id?, page_html_if_scraped)
     """
     u = urllib.parse.urlparse(url)
 
-    # fragment (after #)
+    # fragment (#)
     frag_qs = urllib.parse.parse_qs(u.fragment)
     if "hash" in frag_qs:
         h = frag_qs["hash"][0]
         album_id = frag_qs.get("album_id", [None])[0]
-        return h, album_id
+        return h, album_id, None
 
-    # query (after ?)
+    # query (?)
     qs = urllib.parse.parse_qs(u.query)
     if "hash" in qs:
         h = qs["hash"][0]
         album_id = qs.get("album_id", [None])[0]
-        return h, album_id
+        return h, album_id, None
 
-    # mixsong page scrape
+    # mixsong page
     if re.search(r"/mixsong/([A-Za-z0-9]+)\.html", url):
         resp = requests.get(url, headers=HEADERS_DESKTOP, timeout=15)
         resp.raise_for_status()
         html = resp.text
-
-        # hash
         m_hash = re.search(r'"hash"\s*:\s*"([A-F0-9]{32})"', html, re.I) or \
                  re.search(r'hash=([A-F0-9]{32})', html, re.I)
         if not m_hash:
             raise RuntimeError("Could not find song hash in page.")
         h = m_hash.group(1).upper()
-
-        # album_id (optional)
         m_album = re.search(r'"album_id"\s*:\s*(\d+)', html)
         album_id = m_album.group(1) if m_album else None
-        return h, album_id
+        return h, album_id, html
 
     raise RuntimeError("❌ Could not find hash in URL or page.")
 
 # ---------- Metadata ----------
 def get_mobile_meta(hash_id: str) -> Dict:
-    """
-    Mobile API (free tracks only):
-    https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=<hash>
-    Returns keys like: url, fileName, singerName, imgUrl
-    """
     api = f"https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash={hash_id}"
     r = requests.get(api, headers=HEADERS_MOBILE, timeout=15)
     r.raise_for_status()
@@ -125,10 +114,6 @@ def get_mobile_meta(hash_id: str) -> Dict:
     return data
 
 def get_desktop_meta(hash_id: str, album_id: Optional[str]) -> Optional[Dict]:
-    """
-    Desktop API sometimes contains better cover fields (album_img/union_cover),
-    but it often blocks with status 0/err_code 20010.
-    """
     if not album_id:
         return None
     api = f"https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash={hash_id}&album_id={album_id}"
@@ -139,10 +124,15 @@ def get_desktop_meta(hash_id: str, album_id: Optional[str]) -> Optional[Dict]:
         raise RuntimeError(f"Desktop API unexpected: {payload}")
     return payload["data"]
 
+def extract_album_img_from_page_json(html: str) -> Optional[str]:
+    # Try common JSON keys embedded on the page
+    for key in ("album_img", "union_cover"):
+        m = re.search(rf'"{key}"\s*:\s*"([^"]+)"', html, re.I)
+        if m:
+            return _normalize_img(m.group(1))
+    return None
+
 def fetch_og_image(page_url: str, headers: dict) -> Optional[str]:
-    """
-    Try to read <meta property="og:image" content="..."> from the mixsong page.
-    """
     try:
         resp = requests.get(page_url, headers=headers, timeout=12)
         resp.raise_for_status()
@@ -154,32 +144,58 @@ def fetch_og_image(page_url: str, headers: dict) -> Optional[str]:
         pass
     return None
 
-def choose_best_cover(src_page_url: str, mobile: Dict, desktop: Optional[Dict]) -> Tuple[str, str]:
-    """
-    Order: desktop cover -> page og:image -> mobile imgUrl
-    Returns: (cover_url, source_label)
-    """
-    # 1) desktop data (best when available)
+def fetch_album_page_cover(album_id: str) -> Optional[str]:
+    # Try the desktop album page
+    for album_url in (
+        f"https://www.kugou.com/album/{album_id}.html",
+        f"https://m.kugou.com/share/album/{album_id}.html",
+    ):
+        u = fetch_og_image(album_url, HEADERS_DESKTOP)
+        if u:
+            return u
+    return None
+
+def choose_best_cover(src_page_url: str,
+                      page_html: Optional[str],
+                      album_id: Optional[str],
+                      mobile: Dict,
+                      desktop: Optional[Dict]) -> Tuple[str, str]:
+    # 1) desktop data
     if desktop:
         for key in ("album_img", "union_cover", "img"):
             u = _normalize_img(desktop.get(key, ""))
             if u:
                 return u, f"desktop:{key}"
 
-    # 2) page og:image
-    page_img = fetch_og_image(src_page_url, HEADERS_DESKTOP)
-    if page_img:
-        return page_img, "page:og:image"
+    # 2) album_img from the page JSON (mixsong HTML)
+    if page_html:
+        u = extract_album_img_from_page_json(page_html)
+        if u:
+            return u, "page:album_img"
 
-    # 3) mobile avatar (usually artist pic)
+    # 3) page og:image
+    u = fetch_og_image(src_page_url, HEADERS_DESKTOP)
+    if u:
+        return u, "page:og:image"
+
+    # 4) album page og:image
+    if album_id:
+        u = fetch_album_page_cover(album_id)
+        if u:
+            return u, "album_page:og:image"
+
+    # 5) fallback: mobile imgUrl (artist avatar)
     u = _normalize_img(mobile.get("imgUrl", ""))
     return u, "mobile:imgUrl"
 
 # ---------- Tagging ----------
 def add_basic_id3_tags(filename: str, mobile_data: Dict):
-    audio = mutagen.easyid3.EasyID3(filename)
-    title = mobile_data.get("fileName", "Unknown")
+    file_name = mobile_data.get("fileName", "Unknown")
+    # Title tag: only the right side after "Artist - Title" if present
+    title = file_name.split(" - ", 1)[-1] if " - " in file_name else file_name
     artist = mobile_data.get("singerName", "Unknown")
+
+    audio = mutagen.easyid3.EasyID3(filename)
     audio["title"] = title
     audio["artist"] = artist
     audio.save()
@@ -225,36 +241,36 @@ def main():
     url = args.url.strip()
     print(f"🎵 URL: {url}")
 
-    # Resolve hash (+ optional album_id)
+    # Resolve hash (+ optional album_id) and capture page html if scraped
     try:
-        h, album_id = parse_hash_album_from_url_or_page(url)
+        h, album_id, page_html = parse_hash_album_from_url_or_page(url)
         print(f"🔍 Hash: {h}  |  album_id: {album_id}")
     except Exception as e:
         print("❌ Error:", e)
         sys.exit(2)
 
-    # Query mobile API (for free playback URL)
+    # Mobile API (provides free play URL)
     try:
         mobile = get_mobile_meta(h)
     except Exception as e:
         print("❌ Error:", e)
         sys.exit(3)
 
-    # Try desktop meta just for richer cover (non-fatal)
+    # Desktop meta (non-fatal; richer cover if it works)
     desktop = None
     try:
         desktop = get_desktop_meta(h, album_id)
     except Exception as e:
         print(f"⚠️  Desktop meta not available: {e}")
 
-    # Pick cover
+    # Choose cover
     if args.cover:
         cover_url, cover_src = _normalize_img(args.cover), "override"
     else:
-        cover_url, cover_src = choose_best_cover(url, mobile, desktop)
+        cover_url, cover_src = choose_best_cover(url, page_html, album_id, mobile, desktop)
     print(f"🖼  Cover source: {cover_src} -> {cover_url or 'None'}")
 
-    # Build filename (strip to avoid leading spaces)
+    # Filename as "Artist - Title.mp3" (from mobile fileName), trimmed
     base_name = windows_safe_name(mobile.get("fileName", "Unknown")).strip() + ".mp3"
     out_path = os.path.join(OUTPUT_DIR, base_name)
 
@@ -286,6 +302,6 @@ def main():
     print(f"✅ Done. Saved to: {out_path}")
 
 if __name__ == "__main__":
-    # Please respect KuGou’s Terms of Service and only download tracks that are
-    # offered for free playback in your region. This script does not bypass paywalls.
+    # Please respect KuGou’s Terms of Service; this only downloads tracks
+    # that KuGou serves for free in your region.
     main()
