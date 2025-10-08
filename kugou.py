@@ -41,7 +41,7 @@ def windows_safe_name(name: str) -> str:
 def _normalize_img(u: str) -> str:
     if not u:
         return ""
-    u = u.replace("{size}", "400")
+    u = u.replace("{size}", "1000")
     if u.startswith("http://"):
         u = "https://" + u[7:]
     return u
@@ -134,15 +134,75 @@ def extract_album_img_from_page_json(html: str) -> Optional[str]:
 
 def fetch_og_image(page_url: str, headers: dict) -> Optional[str]:
     try:
-        resp = requests.get(page_url, headers=headers, timeout=12)
-        resp.raise_for_status()
-        html = resp.text
+        r = requests.get(page_url, headers=headers, timeout=12)
+        r.raise_for_status()
+        html = r.text
         m = re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, re.I)
         if m:
-            return _normalize_img(m.group(1))
+            u = m.group(1).replace("{size}", "1000")
+            if u.startswith("http://"):
+                u = "https://" + u[7:]
+            return u
     except Exception:
         pass
     return None
+
+def fetch_mobile_mixsong_og_image(url: str) -> Optional[str]:
+    """
+    If the desktop mixsong page is crippled on mobile/Termux,
+    try the mobile-share variant which often exposes the same og:image.
+    We convert .../mixsong/<mid>.html to .../share/mixsong/<mid>.html
+    """
+    m = re.search(r"/mixsong/([A-Za-z0-9]+)\.html", url)
+    if not m:
+        return None
+    mid = m.group(1)
+    mobile_share = f"https://m.kugou.com/share/mixsong/{mid}.html"
+    return fetch_og_image(mobile_share, HEADERS_MOBILE)
+
+def choose_best_cover(src_page_url: str,
+                      page_html: Optional[str],
+                      album_id: Optional[str],
+                      mobile: Dict,
+                      desktop: Optional[Dict]) -> Tuple[str, str]:
+    # 0) If desktop JSON worked, prefer its album image keys
+    if desktop:
+        for key in ("album_img", "union_cover", "img", "imgUrl"):
+            u = desktop.get(key)
+            if isinstance(u, str) and u:
+                u = u.replace("{size}", "1000")
+                if u.startswith("http://"):
+                    u = "https://" + u[7:]
+                if "imge.kugou.com" in u:  # album server, not singer avatar
+                    return u, f"desktop:{key}"
+
+    # 1) Try og:image on the original (desktop) mixsong page
+    u = fetch_og_image(src_page_url, HEADERS_DESKTOP)
+    if u and "imge.kugou.com" in u:
+        return u, "page:og:image"
+
+    # 2) If that fails on mobile, try the *mobile share* mixsong page
+    u = fetch_mobile_mixsong_og_image(src_page_url)
+    if u and "imge.kugou.com" in u:
+        return u, "mobile_share:og:image"
+
+    # 3) As another fallback, try the album page og:image when album_id is known
+    if album_id:
+        for album_url in (
+            f"https://www.kugou.com/album/{album_id}.html",
+            f"https://m.kugou.com/share/album/{album_id}.html",
+        ):
+            u2 = fetch_og_image(album_url, HEADERS_DESKTOP)
+            if u2 and "imge.kugou.com" in u2:
+                return u2, "album_page:og:image"
+
+    # 4) Absolute fallback: mobile avatar (usually singer head)
+    u = mobile.get("imgUrl") or ""
+    u = u.replace("{size}", "1000")
+    if u.startswith("http://"):
+        u = "https://" + u[7:]
+    return u, "mobile:imgUrl"
+
 
 def fetch_album_page_cover(album_id: str) -> Optional[str]:
     # Try the desktop album page
@@ -155,38 +215,6 @@ def fetch_album_page_cover(album_id: str) -> Optional[str]:
             return u
     return None
 
-def choose_best_cover(src_page_url: str,
-                      page_html: Optional[str],
-                      album_id: Optional[str],
-                      mobile: Dict,
-                      desktop: Optional[Dict]) -> Tuple[str, str]:
-    # 1) desktop data
-    if desktop:
-        for key in ("album_img", "union_cover", "img"):
-            u = _normalize_img(desktop.get(key, ""))
-            if u:
-                return u, f"desktop:{key}"
-
-    # 2) album_img from the page JSON (mixsong HTML)
-    if page_html:
-        u = extract_album_img_from_page_json(page_html)
-        if u:
-            return u, "page:album_img"
-
-    # 3) page og:image
-    u = fetch_og_image(src_page_url, HEADERS_DESKTOP)
-    if u:
-        return u, "page:og:image"
-
-    # 4) album page og:image
-    if album_id:
-        u = fetch_album_page_cover(album_id)
-        if u:
-            return u, "album_page:og:image"
-
-    # 5) fallback: mobile imgUrl (artist avatar)
-    u = _normalize_img(mobile.get("imgUrl", ""))
-    return u, "mobile:imgUrl"
 
 # ---------- Tagging ----------
 def add_basic_id3_tags(filename: str, mobile_data: Dict):
