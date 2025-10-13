@@ -92,6 +92,8 @@ def parse_hash_album_from_url_or_page(url: str) -> Tuple[str, Optional[str], Opt
         resp = requests.get(url, headers=HEADERS_DESKTOP, timeout=15)
         resp.raise_for_status()
         html = resp.text
+        import html as html_lib
+        html = html_lib.unescape(html)
         m_hash = re.search(r'"hash"\s*:\s*"([A-F0-9]{32})"', html, re.I) or \
                  re.search(r'hash=([A-F0-9]{32})', html, re.I)
         if not m_hash:
