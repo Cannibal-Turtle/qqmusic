@@ -88,7 +88,7 @@ def parse_hash_album_from_url_or_page(url: str) -> Tuple[str, Optional[str], Opt
         return h, album_id, None
 
     # mixsong page
-    if re.search(r"/mixsong/([A-Za-z0-9]+)\.html", url):
+    if re.search(r"/(?:mixsong|kgmixsong)/([A-Za-z0-9]+)\.html", url):
         resp = requests.get(url, headers=HEADERS_DESKTOP, timeout=15)
         resp.raise_for_status()
         html = resp.text
@@ -155,7 +155,7 @@ def fetch_mobile_mixsong_og_image(url: str) -> Optional[str]:
     try the mobile-share variant which often exposes the same og:image.
     We convert .../mixsong/<mid>.html to .../share/mixsong/<mid>.html
     """
-    m = re.search(r"/mixsong/([A-Za-z0-9]+)\.html", url)
+    m = re.search(r"/(?:mixsong|kgmixsong)/([A-Za-z0-9]+)\.html", url)
     if not m:
         return None
     mid = m.group(1)
